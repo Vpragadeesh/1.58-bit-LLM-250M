@@ -1,5 +1,7 @@
 import os
 import time
+import math
+import glob
 from datetime import datetime, timezone, timedelta
 import numpy as np
 import torch
@@ -26,7 +28,7 @@ console = Console()
 CONTEXT_WINDOW = 512
 BATCH_SIZE = 2             # Stable on RTX 2050 (3.68 GB VRAM)
 ACCUMULATION_STEPS = 16    # Effective batch = 2 * 16 = 32
-MAX_STEPS = 25_000
+MAX_STEPS = 100_000
 LR = 3e-4
 DATA_PATH = "data/processed/train.bin"
 CHECKPOINT_DIR = "checkpoints"
@@ -40,14 +42,22 @@ def get_batch(data, batch_size, block_size, device):
     return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
 def save_checkpoint(model, optimizer, step, loss, path):
-    """Save training checkpoint to disk."""
+    """Save training checkpoint to disk (atomic: write tmp then rename)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = path + ".tmp"
     torch.save({
         'step': step,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
-    }, path)
+    }, tmp_path)
+    os.replace(tmp_path, path)  # atomic rename
+
+def cleanup_old_checkpoints(checkpoint_dir, keep=3):
+    """Keep only the latest N numbered checkpoints to save disk space."""
+    numbered = sorted(glob.glob(os.path.join(checkpoint_dir, "step_*.pt")))
+    for old in numbered[:-keep]:
+        os.remove(old)
 
 def load_checkpoint(model, optimizer, path, device):
     """Load training checkpoint from disk. Returns the step to resume from."""
@@ -107,7 +117,7 @@ def main():
     if device.type == 'cuda':
         total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         total_vram = f" / {total_vram_gb:.1f} GB total"
-    
+
     config_info = (
         f"• [bold cyan]Device:[/bold cyan] {device}{' (' + torch.cuda.get_device_name(0) + ')' if device.type == 'cuda' else ''}\n"
         f"• [bold cyan]VRAM:[/bold cyan] {total_vram.strip(' / ') if total_vram else 'N/A'}\n"
@@ -159,6 +169,9 @@ def main():
     IST = timezone(timedelta(hours=5, minutes=30))
     training_start = time.time()
 
+    nan_count = 0  # Consecutive NaN counter
+    MAX_NAN = 10   # Abort after this many consecutive NaN steps
+
     with progress:
         for step in range(start_step, MAX_STEPS):
             X, Y = get_batch(data, BATCH_SIZE, CONTEXT_WINDOW, device)
@@ -171,6 +184,19 @@ def main():
 
             raw_loss = loss.item()
 
+            # ── NaN detection ──
+            if math.isnan(raw_loss) or math.isinf(raw_loss):
+                nan_count += 1
+                optimizer.zero_grad()  # Discard this bad batch
+                if nan_count >= MAX_NAN:
+                    console.print(f"\n[bold red]✗ Training diverged![/bold red] {MAX_NAN} consecutive NaN losses.")
+                    console.print("[yellow]Tip: Resume from the last good numbered checkpoint.[/yellow]")
+                    return
+                # Skip this step entirely
+                progress.update(task_id, advance=1, loss="NaN!", tps=current_tps, vram=current_vram, eta_ist=current_eta_ist)
+                continue
+            nan_count = 0  # Reset on valid loss
+
             # Mixed precision backward pass
             scaler.scale(loss_scaled).backward()
 
@@ -178,6 +204,10 @@ def main():
 
             # Optimizer step after gradient accumulation
             if (step + 1) % ACCUMULATION_STEPS == 0:
+                # Gradient clipping to prevent exploding gradients
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -207,12 +237,13 @@ def main():
                 start_time = time.time()
                 tokens_processed = 0
 
-            # Save checkpoint
-            if (step + 1) % CHECKPOINT_EVERY == 0:
+            # Save checkpoint (only if loss is valid)
+            if (step + 1) % CHECKPOINT_EVERY == 0 and not math.isnan(raw_loss):
                 save_checkpoint(model, optimizer, step + 1, raw_loss, latest_ckpt)
                 # Also save a numbered checkpoint
                 numbered_path = os.path.join(CHECKPOINT_DIR, f"step_{step + 1}.pt")
                 save_checkpoint(model, optimizer, step + 1, raw_loss, numbered_path)
+                cleanup_old_checkpoints(CHECKPOINT_DIR, keep=3)
                 console.print(f"\n[bold green]✓ Checkpoint saved[/bold green] at step {step + 1} (loss: {raw_loss:.4f})")
 
             progress.update(
